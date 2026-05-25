@@ -121,11 +121,15 @@ class BaseTask:
         # so it can be applied during env creation (before prepare_sim).
         # For IsaacSim: The manager will be initialized later (scene is already created in __init__)
         is_isaacgym_manager = hasattr(self.simulator, "gym")
-        # Run tasks callback (command_manager.step) BEFORE termination+reward, to
-        # Run commands before termination. Previously this was conditional
-        # on IsaacGym only, but WBT reward/termination expects the motion clip to
-        # have advanced before they evaluate the tracking error.
-        self._update_tasks_before_termination = True
+        # Order of (task callback, termination, reward) per simulator backend:
+        # - IsaacGym: task callback BEFORE termination/reward — its GPU pipeline
+        #   produces NaN rewards under post-reset task callback (Carlo, PR #95).
+        # - IsaacSim (WBT default): task callback AFTER reset. Otherwise on a
+        #   motion-end boundary the resample teleports the robot to the new
+        #   clip's frame BEFORE termination/reward run, so BadTracking sees
+        #   ~0 error and reward exp(-0/sigma^2) → 1, silently rescuing
+        #   episodes that should terminate from accumulated drift.
+        self._update_tasks_before_termination = is_isaacgym_manager
         if is_isaacgym_manager:
             self.randomization_manager = RandomizationManager(randomization_config, self, self.device)
             if self.randomization_manager is not None:

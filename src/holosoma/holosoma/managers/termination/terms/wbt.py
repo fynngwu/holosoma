@@ -144,3 +144,94 @@ class BadTrackingZOnly(BadTracking):
             motion_command.body_pos_relative_w[:, body_idx, -1] - motion_command.robot_body_pos_w[:, body_idx, -1]
         )
         return torch.any(error > self.bad_motion_body_pos_threshold, dim=-1)
+
+
+class BadTrackingSonicStyle(BadTracking):
+    """SONIC-style adaptive termination — relaxes thresholds during low-pelvis sections.
+
+    Goal: stop false-positive terminations on choreography that puts the
+    reference pelvis on the floor (breakdance, kneeling, handstand-to-bridge,
+    supine), which previously caused all such clips to terminate around the
+    floor-touch frame regardless of actual tracking quality.
+
+    Borrowed from gear_sonic's `exceeded_anchor_height` + `exceeded_body_height`
+    + `exceeded_anchor_ori` + `exceeded_body_pos`. Key idea: gate threshold
+    relaxation on the EMA of the reference's pelvis world-z
+    (``motion_command.running_ref_root_height``); when that EMA drops below
+    ``root_height_threshold``, the termination thresholds switch from default
+    (tight) to ``down_*`` (loose) per-env. This lets the policy track through
+    floor sections without termination while still catching real falls during
+    upright dance.
+
+    Replaces the brittle `bad_ref_ori` gravity-projection check (false-fires on
+    any handstand) with a much looser quaternion-error magnitude squared check
+    (``threshold ≈ 1.0 rad² ≈ 57°²``), and replaces the per-body world-frame
+    position check with z-height-only on a small set of bodies (wrists+ankles).
+
+    Required cfg.params (in addition to the base BadTracking params):
+        bad_ref_pos_threshold (float): default anchor z-error tolerance, m. Defaults to 0.5.
+        bad_ref_pos_threshold_low (float): looser tolerance when ref pelvis is low. Defaults to 0.75.
+        bad_motion_body_pos_threshold (float): default per-body z-error tolerance, m. Defaults to 0.5.
+        bad_motion_body_pos_threshold_low (float): looser tolerance when ref pelvis is low. Defaults to 0.75.
+        bad_ref_ori_threshold (float): squared quat-error threshold, rad². Defaults to 1.0.
+        ref_root_height_threshold (float): pelvis-z below this triggers low-pose mode. Defaults to 0.5.
+        bad_motion_body_pos_body_names: bodies to z-check (wrists + ankles only).
+
+    Note: ``bad_motion_body_pos_threshold`` semantics differ from BadTrackingZOnly:
+    here it's a default that can adapt per-env, not a fixed value.
+    """
+
+    def __init__(self, cfg: TerminationTermCfg, env: WholeBodyTrackingManager):
+        super().__init__(cfg, env)
+        self.bad_ref_pos_threshold_low = cfg.params.get("bad_ref_pos_threshold_low", 0.75)
+        self.bad_motion_body_pos_threshold_low = cfg.params.get("bad_motion_body_pos_threshold_low", 0.75)
+        self.ref_root_height_threshold = cfg.params.get("ref_root_height_threshold", 0.5)
+
+    def bad_ref_pos(self, motion_command: MotionCommand) -> torch.Tensor:
+        """Terminate iff |ref_z - robot_z| > adaptive threshold.
+
+        Threshold defaults to ``bad_ref_pos_threshold`` (e.g. 0.5m) and relaxes
+        to ``bad_ref_pos_threshold_low`` (e.g. 0.75m) per-env when the
+        running EMA of reference pelvis z is below ``ref_root_height_threshold``.
+        """
+        z_err = torch.abs(motion_command.ref_pos_w[:, -1] - motion_command.robot_ref_pos_w[:, -1])
+        running_ref_z = getattr(motion_command, "running_ref_root_height", None)
+        if running_ref_z is None:
+            return z_err > self.bad_ref_pos_threshold
+        thresh = torch.full_like(z_err, self.bad_ref_pos_threshold)
+        thresh[running_ref_z < self.ref_root_height_threshold] = self.bad_ref_pos_threshold_low
+        return z_err > thresh
+
+    def bad_ref_ori(self, motion_command: MotionCommand) -> torch.Tensor:
+        """Terminate iff squared quaternion-error magnitude > threshold.
+
+        Replaces gravity-projection difference (which false-fires on any
+        ref inversion) with a symmetric, inversion-tolerant quat-error² check.
+        Default threshold 1.0 rad² ≈ 57°² — only fires on truly divergent
+        orientation, not on cartwheels / handstands.
+        """
+        angular_err = quat_error_magnitude(motion_command.ref_quat_w, motion_command.robot_ref_quat_w)
+        return angular_err.square() > self.bad_ref_ori_threshold
+
+    def bad_motion_body_pos(self, motion_command: MotionCommand) -> torch.Tensor:
+        """Terminate iff any tracked body's z-error exceeds adaptive threshold.
+
+        Per-body z-height only (not full xyz). Adaptive threshold same as
+        bad_ref_pos: relaxed when running ref pelvis z is low.
+        """
+        body_idx = self.bad_motion_body_pos_body_indexes
+        z_err = torch.abs(
+            motion_command.body_pos_relative_w[:, body_idx, -1] - motion_command.robot_body_pos_w[:, body_idx, -1]
+        )
+        running_ref_z = getattr(motion_command, "running_ref_root_height", None)
+        if running_ref_z is None:
+            return torch.any(z_err > self.bad_motion_body_pos_threshold, dim=-1)
+        thresh = torch.full_like(z_err, self.bad_motion_body_pos_threshold)
+        # Per-env: when ref is low, relax all body thresholds for that env.
+        low_mask = (running_ref_z < self.ref_root_height_threshold).unsqueeze(1)
+        thresh = torch.where(
+            low_mask.expand_as(thresh),
+            torch.full_like(thresh, self.bad_motion_body_pos_threshold_low),
+            thresh,
+        )
+        return torch.any(z_err > thresh, dim=-1)

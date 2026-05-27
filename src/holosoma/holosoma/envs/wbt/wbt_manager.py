@@ -78,6 +78,16 @@ class WholeBodyTrackingManager(BaseTask):
         motion_command = self.command_manager.get_state("motion_command")
         motion_command.update_metrics()
         self.log_dict.update(motion_command.metrics)
+        # Optional string-typed diagnostics (e.g., top-K motion clip names from
+        # the failure-weighted samplers). NOT placed in self.log_dict because
+        # downstream TensorAverageMeterDict.add() calls .shape on every value
+        # and would crash on str. Stored separately for the extension's logger
+        # callback to read directly via getattr(env, "log_dict_str", {}).
+        metrics_str = getattr(motion_command, "metrics_str", None)
+        if metrics_str:
+            self.log_dict_str = dict(metrics_str)
+        else:
+            self.log_dict_str = {}
 
     def reset_all(self):
         # If reset_all is called several times, clear buffer in motion_command

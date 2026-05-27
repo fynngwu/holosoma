@@ -150,6 +150,20 @@ class MotionConfig:
     relying on episode termination. The episode continues with the new clip.
     Enabled by default."""
 
+    recompute_velocities_from_positions: bool = False
+    """When True, replace the joint_vel / body_lin_vel_w / body_ang_vel_w arrays
+    loaded from the NPZ with finite-difference estimates from joint_pos /
+    body_pos_w / body_quat_w (central diff). This protects against retargeting
+    bugs where the stored velocity field contains spikes that don't match the
+    smooth position trajectory (e.g. OMOMO clips with single-frame elbow-vel
+    spikes >40 rad/s while joint_pos changes by only ~0.1 rad/frame). Such
+    spikes get applied verbatim during reference-state-init at training time
+    (sim dof_vel <- motion.joint_vel[t]) which spawns the robot with non-physical
+    starting velocities → the policy fails on every reset to those bins, the
+    failure-weighted sampler over-weights the clip, and reward stagnates.
+    Default False for backwards compatibility; recommended True for any data
+    mix that includes OMOMO or other GMR-retargeted clips."""
+
     # adaptive sampling parameters
     adaptive_kernel_size: int = 1
     """Kernel size for smoothing failure bin counts in adaptive sampling."""
@@ -160,8 +174,68 @@ class MotionConfig:
     adaptive_alpha: float = 0.001
     """EMA coefficient used when accumulating per-bin failure counts."""
 
-    adaptive_uniform_ratio: float = 0.1
-    """Fraction of uniform exploration mixed into the adaptive sampling distribution."""
+    adaptive_uniform_ratio: float = 0.5
+    """Fraction of uniform exploration mixed into the adaptive sampling distribution.
+    The motion-id and per-motion-phase samplers (when adaptive_motion_weighting='failure'
+    or adaptive_phase_per_motion=True) use a mixture form
+    ``(1 - r) * failure_normalized + r * uniform``, so each clip / bin retains at least
+    ``r/N`` probability mass regardless of EMA dynamics. Use higher values (~0.7) to
+    avoid runaway failure-feedback collapses on long clips that fail repeatedly during
+    early training; lower values (~0.1) for tighter targeting once the policy has
+    stabilized."""
+
+    motion_sampling_top1_prob_cap: float = 0.0
+    """Hard per-clip cap on the maximum sampling probability. When > 0, no single
+    clip's probability can exceed this value regardless of EMA dynamics — applied
+    post-mixture as a clip-then-renormalize step. Default 0 = no cap. Recommended
+    0.3 (= 30%) when training on a corpus with a few hard clips that would otherwise
+    dominate (e.g. fightAndSports1_subject4 in the LAFAN+SQUAT+ACRO mix). Caps at
+    or below ``r/N`` are no-ops because mixture form already guarantees at least that.
+    """
+
+    motion_exclude_filename_substrings: tuple[str, ...] = ()
+    """Filename substrings for motion clips to exclude from the loaded set. Match is
+    case-sensitive substring on the file basename (no extension). Useful for blacklisting
+    known-pathological clips without modifying the on-disk data, e.g.
+    ``motion_exclude_filename_substrings=("fightAndSports1_subject4",)`` excludes any
+    clip whose basename contains that substring. Default = empty tuple (no exclusion).
+    """
+
+    sonic_style_sampler: bool = False
+    """When True (with adaptive_phase_per_motion=True and adaptive_motion_weighting='failure'),
+    rewrite the motion-id sampling distribution to match SONIC's per-bin formulation:
+      - Per-(motion_id, bin) failure RATE instead of failure COUNT (normalize by episode count)
+      - Hard cap on per-bin failure rate at ``sonic_failure_rate_max_over_mean x mean_rate``
+      - Mixture floor: ``(1-r)*failure_p + r*uniform_p`` (same as default)
+      - Optional per-bin probability cap (water-fill redistribution)
+    The key fix vs default sampler: long clips (e.g. fightAndSports1_subject4 at 60x typical
+    length) no longer dominate by accumulating proportionally more raw failure count — instead
+    they're treated as many independent bins with their own per-bin rate, capped at 200x
+    the mean rate."""
+
+    sonic_failure_rate_max_over_mean: float = 200.0
+    """When sonic_style_sampler=True: cap per-bin failure rate at this multiple of the mean.
+    Matches SONIC's default of 200 (their production runs sonic_release / sonic_h2 use 200).
+    Lower (e.g. 50) curtails outlier clips more aggressively; higher disables the cap."""
+
+    # multi-motion adaptive sampling — two-layer
+    adaptive_motion_weighting: str = "uniform"
+    """How motion_id is sampled at reset when training on a multi-clip dataset:
+      - 'uniform' (default, backward compatible): uniform random across clips, regardless of failure rate.
+      - 'failure': multinomial weighted by per-clip failure EMA. Removes the dilution where long clips
+        contribute more frames to the global failure count (e.g. one 6574-frame dance clip equals 18
+        short flips). Use this for skewed-length multi-clip datasets where you want hard clips
+        oversampled, not just hard 'global frame ranges'.
+    """
+
+    adaptive_phase_per_motion: bool = False
+    """When True, the adaptive timestep sampler is per-motion: bins are partitioned per clip,
+    failure attribution is keyed by (motion_id, bin_within_motion), and phase sampling is conditional
+    on the chosen motion_id. This eliminates the original global-vs-per-clip mismatch where phase
+    is sampled from the global concatenated tensor (representing 'global frame X is hard') but then
+    applied as a per-clip fraction (interpreting it as 'X% into whatever clip got chosen'), which
+    lost spatial information. Only meaningful when use_adaptive_timesteps_sampler is True.
+    Adds a (num_motions, max_K) failure EMA tensor; modest memory overhead."""
 
     # noise related
     noise_to_initial_pose: NoiseToInitialPoseConfig = field(default_factory=NoiseToInitialPoseConfig)

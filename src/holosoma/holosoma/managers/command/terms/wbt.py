@@ -37,11 +37,13 @@ class MotionLoader:
         robot_body_names: list[str],
         robot_joint_names: list[str],
         device: str = "cpu",
+        recompute_velocities_from_positions: bool = False,
     ):
         # Resolve the motion file path using importlib.resources
         motion_file = resolve_data_file_path(motion_file)
 
         logger.info(f"Loading motion file: {motion_file}")
+        self._recompute_velocities = recompute_velocities_from_positions
         body_names_in_motion_data, joint_names_in_motion_data = self._load_data_from_motion_npz(motion_file, device)
         body_indexes = self._get_index_of_a_in_b(robot_body_names, body_names_in_motion_data, device)
         joint_indexes = self._get_index_of_a_in_b(robot_joint_names, joint_names_in_motion_data, device)
@@ -139,6 +141,9 @@ class MotionLoader:
 
             self._body_lin_vel_w = torch.tensor(body_lin_vel_w_raw, dtype=torch.float32, device=device)
             self._body_ang_vel_w = torch.tensor(body_ang_vel_w_raw, dtype=torch.float32, device=device)
+
+            if getattr(self, "_recompute_velocities", False):
+                self._recompute_velocity_fields(motion_file)
 
             # Load motion_ends / motion_idxs for multi-clip files (from combine_motions).
             # Ref consumes these in step() to resample envs at each source-clip boundary;
@@ -240,6 +245,73 @@ class MotionLoader:
         return 1
 
     @property
+    def motion_filenames(self) -> List[str]:
+        return ["<single_motion>"]
+
+    def _recompute_velocity_fields(self, motion_file: str) -> None:
+        """Replace stored velocity arrays with finite-difference estimates from positions.
+
+        Defensive sanitization: when the stored velocity field disagrees with the
+        position trajectory (e.g. retargeted clips where joint_vel was computed
+        in a different frame than joint_pos, leaving spikes mid-clip), the
+        position trajectory is the source of truth. This recomputes
+        joint_vel / body_lin_vel_w / body_ang_vel_w from joint_pos / body_pos_w /
+        body_quat_w via central-difference. Endpoints use forward/backward diff.
+
+        Note: this does NOT smooth the positions themselves. If the position
+        trajectory contains real discontinuities (e.g. IK ambiguity flips
+        producing 50+ rad/s implied velocity), the recomputed velocities will
+        still reflect them. This is the desired behavior — preserve the
+        trajectory; let the sampler / termination handle hard clips.
+        """
+        from holosoma.utils.rotations import quat_conjugate, quat_mul, quat_to_angle_axis
+
+        fps = float(self.fps)
+
+        # Joint vel: central diff of joint_pos (already root-stripped, shape (T, J))
+        jp = self._joint_pos
+        jv_recomputed = torch.zeros_like(self._joint_vel)
+        jv_recomputed[1:-1] = (jp[2:] - jp[:-2]) * (fps / 2.0)
+        jv_recomputed[0] = (jp[1] - jp[0]) * fps
+        jv_recomputed[-1] = (jp[-1] - jp[-2]) * fps
+
+        # Body lin vel: central diff of body_pos_w (T, B, 3)
+        bp = self._body_pos_w
+        blv_recomputed = torch.zeros_like(self._body_lin_vel_w)
+        blv_recomputed[1:-1] = (bp[2:] - bp[:-2]) * (fps / 2.0)
+        blv_recomputed[0] = (bp[1] - bp[0]) * fps
+        blv_recomputed[-1] = (bp[-1] - bp[-2]) * fps
+
+        # Body ang vel from relative quaternion / dt
+        bq = self._body_quat_w  # xyzw, (T, B, 4)
+        T = bq.shape[0]
+        bav_recomputed = torch.zeros_like(self._body_ang_vel_w)
+        if T >= 2:
+            q_next = bq[2:]
+            q_prev_conj = quat_conjugate(bq[:-2], w_last=True)
+            q_rel_central = quat_mul(q_next, q_prev_conj, w_last=True)
+            angle_c, axis_c = quat_to_angle_axis(q_rel_central)
+            bav_recomputed[1:-1] = axis_c * (angle_c.unsqueeze(-1) * (fps / 2.0))
+            q_rel_fwd = quat_mul(bq[1], quat_conjugate(bq[0], w_last=True), w_last=True)
+            angle_f, axis_f = quat_to_angle_axis(q_rel_fwd)
+            bav_recomputed[0] = axis_f * (angle_f.unsqueeze(-1) * fps)
+            q_rel_bwd = quat_mul(bq[-1], quat_conjugate(bq[-2], w_last=True), w_last=True)
+            angle_b, axis_b = quat_to_angle_axis(q_rel_bwd)
+            bav_recomputed[-1] = axis_b * (angle_b.unsqueeze(-1) * fps)
+
+        old_jv_max = float(self._joint_vel.abs().max())
+        new_jv_max = float(jv_recomputed.abs().max())
+        if old_jv_max > new_jv_max * 2 + 5:
+            logger.info(
+                f"[recompute_velocities] {motion_file}: stored joint_vel disagreed with "
+                f"joint_pos delta; max|joint_vel| {old_jv_max:.2f} -> {new_jv_max:.2f} rad/s"
+            )
+
+        self._joint_vel = jv_recomputed
+        self._body_lin_vel_w = blv_recomputed
+        self._body_ang_vel_w = bav_recomputed
+
+    @property
     def motion_start_idx(self) -> torch.Tensor:
         return torch.tensor([0], dtype=torch.long, device=self._joint_pos.device)
 
@@ -290,6 +362,8 @@ class MultiMotionLoader:
         device: str = "cpu",
         shard_rank: int = 0,
         shard_world_size: int = 1,
+        recompute_velocities_from_positions: bool = False,
+        exclude_filename_substrings: tuple = (),
     ):
         # Support comma-separated directories for combining multiple datasets
         dirs = [d.strip() for d in motion_dir.split(",")]
@@ -300,6 +374,29 @@ class MultiMotionLoader:
             logger.info(f"MultiMotionLoader: found {len(files)} .npz files in {expanded}")
             motion_files.extend(files)
         assert len(motion_files) > 0, f"No .npz files found in {motion_dir}"
+
+        # Apply substring blacklist (e.g. exclude known-pathological clips like
+        # fightAndSports1_subject4 that dominate the failure-weighted sampler).
+        if exclude_filename_substrings:
+            patterns = tuple(s for s in exclude_filename_substrings if s)
+            n_before = len(motion_files)
+            motion_files = [f for f in motion_files if not any(pat in Path(f).stem for pat in patterns)]
+            n_excluded = n_before - len(motion_files)
+            # Always log the parsed exclusion list so silent no-ops (e.g. tyro
+            # parsing the literal Python tuple syntax `("foo",)` as a single
+            # string element rather than a real tuple) become visible at startup.
+            logger.info(
+                f"MultiMotionLoader: motion_exclude_filename_substrings={patterns}, "
+                f"matched and excluded {n_excluded} of {n_before} files"
+            )
+            if patterns and n_excluded == 0:
+                logger.warning(
+                    f"MultiMotionLoader: exclusion patterns {patterns} matched 0 files. "
+                    "Check that you used positional syntax (e.g. "
+                    "`--motion-exclude-filename-substrings fightAndSports1_subject4`) "
+                    "and not Python-literal syntax `('fightAndSports1_subject4',)` — "
+                    "tyro parses the latter as a single literal string."
+                )
 
         # Shard motion files across GPUs when shard_world_size > 1
         if shard_world_size > 1:
@@ -313,16 +410,25 @@ class MultiMotionLoader:
             logger.info(f"MultiMotionLoader: loading {len(motion_files)} total motion files")
 
         loaders = []
+        loader_basenames: list[str] = []
         skipped = 0
         for mf in motion_files:
             try:
-                loader = MotionLoader(mf, robot_body_names, robot_joint_names, device=device)
-                loaders.append(loader)
-            except (KeyError, AssertionError, ValueError) as e:  # noqa: PERF203
+                loader = MotionLoader(
+                    mf,
+                    robot_body_names,
+                    robot_joint_names,
+                    device=device,
+                    recompute_velocities_from_positions=recompute_velocities_from_positions,
+                )
+            except (KeyError, AssertionError, ValueError) as e:
                 # Skip files with incompatible format (e.g., missing body_names, wrong body count)
                 skipped += 1
                 if skipped <= 3:
                     logger.warning(f"MultiMotionLoader: skipping {mf}: {e}")
+                continue
+            loaders.append(loader)
+            loader_basenames.append(Path(mf).stem)
         if skipped > 3:
             logger.warning(f"MultiMotionLoader: skipped {skipped} files total due to format issues")
         assert len(loaders) > 0, f"No compatible motion files found (skipped {skipped})"
@@ -333,6 +439,18 @@ class MultiMotionLoader:
         self._motion_start_idx = torch.cat([torch.tensor([0], dtype=torch.long, device=device), cumulative[:-1]])
         self._motion_end_idx = cumulative
         self._num_motions = len(loaders)
+
+        # Per-motion-id basename list — built in the same loop as loaders so the
+        # i-th name maps to the i-th loader / motion_id. This is the diagnostic the
+        # failure-weighted sampler uses to identify which clip is being concentrated on.
+        # NOTE: motion_files is the per-rank shard, so motion_id i in this loader maps
+        # to motion_files[i] for THIS rank's sampler. Different ranks can collapse onto
+        # different clips when shard_motions=True.
+        self._motion_filenames = loader_basenames
+        assert len(self._motion_filenames) == self._num_motions, (
+            f"motion_filenames ({len(self._motion_filenames)}) != num_motions ({self._num_motions}) — "
+            "internal accounting bug in MultiMotionLoader"
+        )
 
         # Concatenate all motion data
         self._joint_pos = torch.cat([ld._joint_pos for ld in loaders], dim=0)
@@ -373,6 +491,15 @@ class MultiMotionLoader:
     @property
     def num_motions(self) -> int:
         return self._num_motions
+
+    @property
+    def motion_filenames(self) -> List[str]:
+        """Per-motion-id filename stems (without extension), aligned with sampler IDs.
+
+        Used by adaptive samplers (Layer-1 / Two-layer) for top-K diagnostic logging:
+        identify the actual clip the failure-weighted sampler is concentrating on.
+        """
+        return self._motion_filenames
 
     @property
     def motion_start_idx(self) -> torch.Tensor:
@@ -588,9 +715,340 @@ class AdaptiveTimestepsSampler:
         self.metrics["sampling_top1_bin"] = imax.float() / self.num_bins
 
 
+class TwoLayerAdaptiveSampler:
+    """Per-motion adaptive sampler: failure rates tracked per (motion_id, bin_within_motion).
+
+    Layer 1: choose motion_id by per-clip failure EMA. Length-imbalanced clips no longer dilute
+    each other (a 6574-frame dance and a 358-frame flip both contribute one EMA scalar).
+
+    Layer 2: choose phase ∈ [0,1) conditioned on the chosen motion_id, using per-motion bins.
+    The phase is then applied as start_idx + phase * (motion_len-1) — and now both training and
+    application share the per-clip semantic, no more global-vs-per-clip mismatch.
+
+    Storage: dense (num_motions, max_K) tensor. Bins beyond a motion's actual K_i are masked.
+
+    NOTE: motion_start_idx / motion_end_idx are passed in; this sampler does not own the loader.
+    """
+
+    def __init__(
+        self,
+        motion_start_idx: torch.Tensor,
+        motion_end_idx: torch.Tensor,
+        device: str,
+        env_fps: int,
+        adaptive_lambda: float = 0.8,
+        adaptive_uniform_ratio: float = 0.1,
+        adaptive_alpha: float = 0.001,
+        motion_filenames: list[str] | None = None,
+        top1_prob_cap: float = 0.0,
+        sonic_style: bool = False,
+        sonic_failure_rate_max_over_mean: float = 200.0,
+    ):
+        self.device = device
+        self.env_fps = max(env_fps, 1)
+        self.adaptive_alpha = adaptive_alpha
+        self.adaptive_uniform_ratio = adaptive_uniform_ratio
+        self.adaptive_lambda = adaptive_lambda
+        # Hard per-clip cap on max sampling probability (0 = no cap).
+        # When set (e.g. 0.30), no single clip can exceed this fraction of
+        # the total sampling mass — applied via water-fill redistribution
+        # post-mixture in motion_sampling_probabilities.
+        self.top1_prob_cap = float(top1_prob_cap)
+        # SONIC-style sampling: use per-bin failure RATE (not count) with a
+        # max-over-mean cap. Long clips don't dominate because the rate is
+        # length-independent.
+        self.sonic_style = bool(sonic_style)
+        self.sonic_failure_rate_max_over_mean = float(sonic_failure_rate_max_over_mean)
+
+        self.motion_start_idx = motion_start_idx.to(device).long()
+        self.motion_end_idx = motion_end_idx.to(device).long()
+        self.num_motions = int(self.motion_start_idx.numel())
+        # Per-motion-id filename stems for top-K diagnostic logging. None = unavailable.
+        self.motion_filenames = motion_filenames
+        self.motion_lengths = (self.motion_end_idx - self.motion_start_idx).clamp(min=1)
+        # Per-motion bin count: 1 second granularity (matches single-layer sampler).
+        self.K_per_motion = (self.motion_lengths // self.env_fps + 1).long()
+        self.K_max = int(self.K_per_motion.max().item())
+
+        # Per-motion failure EMA (Layer 1) — initialized to ones so first reset is uniform.
+        self.motion_failed_ema = torch.ones(self.num_motions, dtype=torch.float, device=device)
+
+        # Per-(motion, bin) failure EMA (Layer 2) — initialized to ones in valid bins, 0 in masked bins.
+        valid_mask = torch.arange(self.K_max, device=device).unsqueeze(0) < self.K_per_motion.unsqueeze(
+            1
+        )  # (num_motions, K_max), bool
+        self.bin_valid_mask = valid_mask
+        self.bin_failed_ema = valid_mask.float().clone()
+
+        # SONIC-style: also track episode-count EMA per (motion, bin) so we can compute
+        # failure_rate = failed / episodes. Init to ones (matches SONIC's pseudo-count
+        # init that prevents NaN at start).
+        if self.sonic_style:
+            self.bin_episode_ema = valid_mask.float().clone()
+
+        self.metrics: dict[str, torch.Tensor] = {}
+
+    def update_episodes_and_failures(
+        self,
+        reset_motion_ids: torch.Tensor,
+        reset_local_t: torch.Tensor,
+        failed_mask: torch.Tensor,
+    ) -> None:
+        """Inject reset-time episode + failure events into both layer EMAs.
+
+        Mirrors gear_sonic ``update_adaptive_sampling`` (motion_lib_base.py:2462):
+        SONIC credits BOTH the episode counter and the failure counter at the
+        END time-step bin (i.e., the bin where the env terminated/reset). All
+        reset envs (failed or timed-out) bump the episode counter; only the
+        failed-mask subset bumps the failure counter. This keeps the per-bin
+        rate ``failed/episode`` properly aligned: numerator and denominator
+        index the same bin.
+
+        Decay is NOT applied here — it runs every env step inside
+        ``MotionCommand.step()`` (parity with the legacy ``AdaptiveTimestepsSampler``).
+        This method only adds the alpha-weighted instantaneous count.
+
+        Args:
+            reset_motion_ids: (n_reset,) clip index for every reset env.
+            reset_local_t: (n_reset,) frame within that clip at reset time
+                (i.e., time_step - motion_start_idx).
+            failed_mask: (n_reset,) bool, True for reset envs that terminated
+                due to failure (vs timeout / episode-length limit).
+        """
+        if reset_motion_ids.numel() == 0:
+            return
+
+        # Per-(motion, bin_within_motion) bin index for each reset env.
+        K_per_reset = self.K_per_motion[reset_motion_ids]
+        len_per_reset = self.motion_lengths[reset_motion_ids]
+        reset_bins = torch.minimum(
+            (reset_local_t.long() * K_per_reset) // len_per_reset.clamp(min=1),
+            K_per_reset - 1,
+        )
+        reset_flat_idx = reset_motion_ids * self.K_max + reset_bins
+        reset_inc = (
+            torch.bincount(reset_flat_idx, minlength=self.num_motions * self.K_max)
+            .float()
+            .view(self.num_motions, self.K_max)
+            * self.bin_valid_mask.float()
+        )
+
+        # SONIC-style: credit episode count for ALL reset envs at the end-bin.
+        # Required so the per-bin rate denominator tracks bins actually reached
+        # (otherwise easy clips that timeout-but-never-fail get rate→1, making
+        # them look hard).
+        if self.sonic_style and hasattr(self, "bin_episode_ema"):
+            self.bin_episode_ema = self.bin_episode_ema + self.adaptive_alpha * reset_inc
+
+        # Failure-only updates (subset of reset envs).
+        failed_motion_ids = reset_motion_ids[failed_mask]
+        if failed_motion_ids.numel() == 0:
+            return
+
+        # Layer 1: per-motion failure count → alpha-weighted increment.
+        layer1_inc = torch.bincount(failed_motion_ids, minlength=self.num_motions).float()
+        self.motion_failed_ema = self.motion_failed_ema + self.adaptive_alpha * layer1_inc
+
+        # Layer 2: per-(motion, bin) failure count, restricted to failed envs.
+        failed_flat_idx = reset_flat_idx[failed_mask]
+        layer2_inc = (
+            torch.bincount(failed_flat_idx, minlength=self.num_motions * self.K_max)
+            .float()
+            .view(self.num_motions, self.K_max)
+            * self.bin_valid_mask.float()
+        )
+        self.bin_failed_ema = self.bin_failed_ema + self.adaptive_alpha * layer2_inc
+
+    # Backward-compat shim: callers that only have failure data (no reset_mask)
+    # can still funnel through update_episodes_and_failures by treating every
+    # reset as a failure. Used by Layer-1-only callers and as a safety net for
+    # external code paths that haven't been updated. SONIC-style mode requires
+    # the new entry point because the episode denominator is meaningful.
+    def update_failures(
+        self,
+        failed_motion_ids: torch.Tensor,
+        failed_local_t: torch.Tensor,
+    ) -> None:
+        if failed_motion_ids.numel() == 0:
+            return
+        failed_mask = torch.ones(failed_motion_ids.numel(), dtype=torch.bool, device=self.device)
+        self.update_episodes_and_failures(failed_motion_ids, failed_local_t, failed_mask)
+
+    @property
+    def motion_sampling_probabilities(self) -> torch.Tensor:
+        """Per-motion-id sampling distribution.
+
+        Default mode: mixture-form on per-clip failure COUNT EMA. Bug: long clips
+        (e.g. fightAndSports1_subject4 at 12257 frames vs typical 200) accumulate
+        proportionally more failure events even at uniform per-frame failure rate,
+        so they dominate. Mitigated (but not eliminated) by mixture floor + hard cap.
+
+        SONIC-style mode (sonic_style=True): aggregate per-bin failure RATE — i.e.
+        ``failure_count / episode_count`` averaged across bins of each motion.
+        Length-independent. Cap per-motion rate at ``sonic_failure_rate_max_over_mean
+        x mean_rate`` (default 200x) before normalizing. Mixture floor applied on top.
+        """
+        n = self.num_motions
+        uniform_p = torch.full((n,), 1.0 / max(n, 1), device=self.device)
+        r = float(self.adaptive_uniform_ratio)
+
+        if self.sonic_style and hasattr(self, "bin_episode_ema"):
+            # SONIC reference: per-BIN failure rate is failed/episode (motion_lib_base.py:2531),
+            # then capped at mean x max_over_mean (default 200), normalized to a per-bin
+            # distribution, and finally aggregated to per-motion by SUMMING the (capped,
+            # uniform-mixed) per-bin probabilities over each motion's bins
+            # (motion_lib_base.py:2730-2734). This makes the per-motion sampling probability
+            # length-independent: a long clip's bins each get a cap-bounded share, and their
+            # sum ∝ (clipped_rate x num_bins / total_clipped_rate x some_norm). Critically,
+            # the rate is NOT averaged over a clip's bins — it is summed (after capping),
+            # so a clip with one truly hard bin and many easy bins is still sampled
+            # proportionally. Mirroring this here:
+            valid = self.bin_valid_mask.float()
+            per_bin_rate = self.bin_failed_ema / self.bin_episode_ema.clamp(min=1e-6)
+            per_bin_rate = per_bin_rate * valid  # zero invalid bins
+
+            # Step 1: cap per-bin rate at mean (across valid bins) x max_over_mean.
+            max_over_mean = self.sonic_failure_rate_max_over_mean
+            valid_total = valid.sum().clamp(min=1.0)
+            mean_rate = per_bin_rate.sum() / valid_total  # mean over valid bins
+            rate_cap = mean_rate.clamp(min=1e-12) * max_over_mean
+            per_bin_rate_clipped = per_bin_rate.clamp(max=rate_cap) * valid
+
+            # Step 2: aggregate to per-motion by summing each motion's bin rates.
+            # Length-independent in the same sense as SONIC: capping bounds each bin's
+            # contribution; longer clips with more bins still get more probability mass
+            # but only proportional to bin count, not proportional to length x per-bin-rate.
+            per_motion_rate = per_bin_rate_clipped.sum(dim=1)  # (num_motions,)
+            failure_p = per_motion_rate / per_motion_rate.sum().clamp(min=1e-12)
+        else:
+            ema = self.motion_failed_ema
+            failure_p = ema / ema.sum().clamp(min=1e-12)
+
+        p = (1.0 - r) * failure_p + r * uniform_p
+        # Hard per-clip prob cap (water-fill). Layered on top of failure-rate cap above.
+        if self.top1_prob_cap > 0:
+            p = _apply_prob_cap(p, self.top1_prob_cap)
+        return p
+
+    def per_motion_phase_distribution(self, motion_ids: torch.Tensor) -> torch.Tensor:
+        """Return (n, K_max) phase-bin distribution conditioned on each env's chosen motion_id.
+
+        Mixture form: (1 - r) * (bin_ema-normalized over valid bins) + r * uniform_over_valid_bins.
+        Masked (invalid) bins receive zero probability via valid_mask multiply at the end.
+        """
+        bin_ema = self.bin_failed_ema[motion_ids]  # (n, K_max)
+        valid = self.bin_valid_mask[motion_ids].float()  # (n, K_max), 0/1
+        per_env_valid_count = valid.sum(dim=1, keepdim=True).clamp(min=1.0)  # (n, 1)
+        # Failure-driven part, normalized over valid bins.
+        masked_ema = bin_ema * valid
+        masked_sum = masked_ema.sum(dim=1, keepdim=True).clamp(min=1e-12)
+        failure_p = masked_ema / masked_sum  # (n, K_max), zeros on invalid bins
+        # Uniform-over-valid-bins part.
+        uniform_p = valid / per_env_valid_count
+        r = float(self.adaptive_uniform_ratio)
+        return (1.0 - r) * failure_p + r * uniform_p
+
+    def sample(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (motion_ids, phase) jointly sampled from the two-layer distribution.
+
+        phase ∈ [0, 1) is the per-clip fraction (consistent with the apply step).
+        """
+        # Layer 1: motion ids
+        motion_probs = self.motion_sampling_probabilities
+        motion_ids = torch.multinomial(motion_probs, n, replacement=True)
+
+        # Layer 2: phase, conditioned on motion_ids
+        phase_probs = self.per_motion_phase_distribution(motion_ids)  # (n, K_max)
+        sampled_bins = torch.multinomial(phase_probs, 1, replacement=True).squeeze(1)  # (n,)
+        # Each motion has its own K_i; clamp sampled_bins (already in [0, K_max-1] but
+        # could exceed K_per_motion - 1 if floor produced an invalid hit).
+        K_per_env = self.K_per_motion[motion_ids]
+        sampled_bins = torch.minimum(sampled_bins, K_per_env - 1)
+        # NOTE: bin_episode_ema is credited inside update_episodes_and_failures at the
+        # END-time-step bin (where the env actually terminated/reset), NOT here at the
+        # start-time-step bin. Mirrors SONIC reference (motion_lib_base.py:2479-2487):
+        # both num_episodes and num_failures are bumped at the same bin so per-bin rate
+        # ``failed/episode`` stays aligned. Crediting episodes here would put numerator
+        # and denominator at different bins.
+        # Convert bin index to phase ∈ [0, 1).
+        phase = (sampled_bins.float() + torch.rand(n, device=self.device)) / K_per_env.float()
+        phase = phase.clamp(0.0, 1.0 - 1e-6)
+        return motion_ids, phase
+
+    def get_stats(self):
+        # Layer 1 entropy.
+        p = self.motion_sampling_probabilities
+        H = -(p * (p + 1e-12).log()).sum()
+        H_norm_motion = H / max(1.0, np.log(max(self.num_motions, 1)))
+        # Layer 1 top-1.
+        p_max, idx_max = p.max(dim=0)
+        # Layer 2: average entropy across motions of their per-motion bin distribution.
+        all_motion_ids = torch.arange(self.num_motions, device=self.device)
+        bin_p = self.per_motion_phase_distribution(all_motion_ids)  # (num_motions, K_max)
+        bin_H = -(bin_p * (bin_p + 1e-12).log()).sum(dim=1).mean()
+        bin_H_norm = bin_H / max(1.0, np.log(max(self.K_max, 1)))
+        self.metrics["motion_sampling_entropy"] = H_norm_motion
+        self.metrics["motion_sampling_top1_prob"] = p_max
+        self.metrics["motion_sampling_top1_id"] = idx_max.float() / max(self.num_motions, 1)
+        self.metrics["motion_phase_avg_entropy"] = bin_H_norm
+
+        # Top-K motion clip diagnostics: which clips is the failure-weighted sampler
+        # concentrating on? Logged as scalars (top1..top10 probs and integer ids) plus
+        # a single comma-joined name string in metrics_str (consumed by wbt_manager
+        # and pushed to wandb as a Table) for easy spotting of pathological clips.
+        K = min(10, int(self.num_motions))
+        topk_probs, topk_ids = torch.topk(p, K)
+        self.metrics["motion_sampling_top1_id_int"] = idx_max.float()  # raw integer for clarity
+        for k in range(K):
+            self.metrics[f"motion_sampling_top{k + 1}_prob"] = topk_probs[k]
+            self.metrics[f"motion_sampling_top{k + 1}_id_int"] = topk_ids[k].float()
+        if self.motion_filenames is not None and len(self.motion_filenames) >= self.num_motions:
+            top_names = [self.motion_filenames[int(i)] for i in topk_ids.cpu().tolist()]
+            top_pcts = [f"{float(topk_probs[k]):.3f}" for k in range(K)]
+            # String concat — consumers of metrics_str (e.g. wbt_manager) can
+            # log this as a wandb.Html / wandb.Table for richer display.
+            self.metrics_str = getattr(self, "metrics_str", {})
+            self.metrics_str["motion_sampling_top10_names"] = ", ".join(
+                f"{n}({p})" for n, p in zip(top_names, top_pcts)
+            )
+
+
 #########################################################################################################
 ## Helper functions
 #########################################################################################################
+def _apply_prob_cap(p: torch.Tensor, cap: float, max_passes: int = 50) -> torch.Tensor:
+    """Redistribute probability mass so no entry exceeds ``cap``.
+
+    Iteratively clip entries above ``cap`` and add the excess uniformly to the rest,
+    until convergence. Robust water-fill — terminates after at most max_passes iterations
+    or when no entry exceeds the cap. Cap must be > 1/N or the operation is impossible
+    (returns uniform in that degenerate case).
+
+    Used by adaptive samplers to enforce a hard ceiling on any single clip's sampling
+    probability, e.g. preventing one pathologically-hard clip from dominating training.
+    """
+    if cap <= 0 or cap >= 1.0:
+        return p
+    n = p.numel()
+    if cap * n <= 1.0:
+        # Cap is below the uniform floor → return uniform (best feasible)
+        return torch.full_like(p, 1.0 / max(n, 1))
+    p = p.clone()
+    for _ in range(max_passes):
+        over_mask = p > cap
+        n_over = int(over_mask.sum())
+        if n_over == 0:
+            break
+        excess = (p[over_mask] - cap).sum()
+        p[over_mask] = cap
+        below_mask = ~over_mask
+        n_below = int(below_mask.sum())
+        if n_below == 0:
+            break
+        p[below_mask] = p[below_mask] + excess / n_below
+    return p
+
+
 FAKE_BODY_NAME_ALIASES: dict[str, str] = {
     # Fake foot contact bodies are authored in the URDF purely for height computation.
     # They do not exist in the motion-capture dataset, so we alias them back to the
@@ -648,6 +1106,10 @@ class MotionCommand(CommandTermBase):
                 device=self.device,
                 shard_rank=shard_rank,
                 shard_world_size=shard_world_size,
+                recompute_velocities_from_positions=getattr(
+                    self.motion_cfg, "recompute_velocities_from_positions", False
+                ),
+                exclude_filename_substrings=tuple(getattr(self.motion_cfg, "motion_exclude_filename_substrings", ())),
             )
         else:
             self.motion = MotionLoader(
@@ -655,6 +1117,9 @@ class MotionCommand(CommandTermBase):
                 robot_body_names_alias,
                 robot_joint_names,
                 device=self.device,
+                recompute_velocities_from_positions=getattr(
+                    self.motion_cfg, "recompute_velocities_from_positions", False
+                ),
             )
 
         # Store body and joint indexes for interpolation
@@ -692,6 +1157,27 @@ class MotionCommand(CommandTermBase):
             )
 
         # 4. get the adaptive timesteps sampler
+        # Validate adaptive sampling flags loudly at setup time. typos in the
+        # weighting string would otherwise silently fall through to uniform.
+        _adaptive_motion_weighting = getattr(self.motion_cfg, "adaptive_motion_weighting", "uniform")
+        if _adaptive_motion_weighting not in ("uniform", "failure"):
+            raise ValueError(
+                f"motion_cfg.adaptive_motion_weighting must be 'uniform' or 'failure', "
+                f"got {_adaptive_motion_weighting!r}. Check for typos / case mismatch."
+            )
+        _adaptive_phase_per_motion = bool(getattr(self.motion_cfg, "adaptive_phase_per_motion", False))
+        # Warn if user enabled new flags but forgot to enable the global adaptive sampler
+        # (the new code paths only activate when use_adaptive_timesteps_sampler is True).
+        if not self.motion_cfg.use_adaptive_timesteps_sampler and (
+            _adaptive_motion_weighting != "uniform" or _adaptive_phase_per_motion
+        ):
+            logger.warning(
+                "adaptive_motion_weighting=%s and adaptive_phase_per_motion=%s set, but "
+                "use_adaptive_timesteps_sampler=False — both new flags are silently ignored.",
+                _adaptive_motion_weighting,
+                _adaptive_phase_per_motion,
+            )
+
         if self.motion_cfg.use_adaptive_timesteps_sampler:
             self.adaptive_timesteps_sampler = AdaptiveTimestepsSampler(
                 self.motion.time_step_total,
@@ -702,6 +1188,34 @@ class MotionCommand(CommandTermBase):
                 adaptive_uniform_ratio=self.motion_cfg.adaptive_uniform_ratio,
                 adaptive_alpha=self.motion_cfg.adaptive_alpha,
             )
+            # Two-layer adaptive sampler — opt-in via config. Co-exists with the single-layer
+            # sampler above so we can keep that path's bin metrics for monitoring.
+            if _adaptive_phase_per_motion:
+                self.two_layer_sampler = TwoLayerAdaptiveSampler(
+                    motion_start_idx=self.motion.motion_start_idx,
+                    motion_end_idx=self.motion.motion_end_idx,
+                    device=self.device,
+                    env_fps=int(1 / (self._env.dt)),
+                    adaptive_lambda=self.motion_cfg.adaptive_lambda,
+                    adaptive_uniform_ratio=self.motion_cfg.adaptive_uniform_ratio,
+                    adaptive_alpha=self.motion_cfg.adaptive_alpha,
+                    motion_filenames=getattr(self.motion, "motion_filenames", None),
+                    top1_prob_cap=float(getattr(self.motion_cfg, "motion_sampling_top1_prob_cap", 0.0)),
+                    sonic_style=bool(getattr(self.motion_cfg, "sonic_style_sampler", False)),
+                    sonic_failure_rate_max_over_mean=float(
+                        getattr(self.motion_cfg, "sonic_failure_rate_max_over_mean", 200.0)
+                    ),
+                )
+            else:
+                self.two_layer_sampler = None  # type: ignore[assignment]
+            # Per-motion failure EMA - used when adaptive_motion_weighting='failure' but
+            # adaptive_phase_per_motion=False (Layer-1-only mode).
+            if _adaptive_motion_weighting == "failure" and not _adaptive_phase_per_motion:
+                self._motion_failed_ema_layer1_only = torch.ones(
+                    int(self.motion.num_motions), dtype=torch.float, device=self.device
+                )
+            else:
+                self._motion_failed_ema_layer1_only = None
 
         # 5. metrics
         self.metrics: dict[str, torch.Tensor] = {}
@@ -718,25 +1232,86 @@ class MotionCommand(CommandTermBase):
         if env_ids.numel() == 0:
             return
 
-        # 0. Sample the time steps
+        n = env_ids.numel()
+        num_motions = self.motion.num_motions
+
+        # 0. Sample the time steps (three modes: uniform, failure-weighted Layer-1 only,
+        #    or full two-layer per-motion phase).
+        use_two_layer = (
+            self.motion_cfg.use_adaptive_timesteps_sampler and getattr(self, "two_layer_sampler", None) is not None
+        )
+        use_layer1_only = (
+            self.motion_cfg.use_adaptive_timesteps_sampler
+            and not use_two_layer
+            and getattr(self, "_motion_failed_ema_layer1_only", None) is not None
+        )
+
         if self.motion_cfg.use_adaptive_timesteps_sampler:
-            # Match BeyondMimic behavior: update failed bins from environments
-            # that terminated before this reset, then sample new phases.
-            episode_failed = self._env.termination_manager.terminated[env_ids]
+            # Failure attribution from envs that terminated since last reset.
+            # Gated on NOT is_evaluating so eval episodes don't pollute the
+            # training-time EMAs (legacy single-layer + two-layer + layer1-only).
+            if not self._env.is_evaluating:
+                episode_failed = self._env.termination_manager.terminated[env_ids]
+            else:
+                episode_failed = torch.zeros_like(env_ids, dtype=torch.bool)
+
+            # Two-layer sampler (incl. SONIC-style): credit episode count for ALL
+            # reset envs at end-bin, and credit failure count for the failed-mask
+            # subset at the same bin. Required during training (not eval) and only
+            # when there's anything to credit.
+            if use_two_layer and not self._env.is_evaluating and env_ids.numel() > 0:
+                reset_at_time_step = self.time_steps[env_ids]
+                clamped_ts = reset_at_time_step.clamp(0, self.motion.time_step_total - 1)
+                reset_motion_ids = self.motion.motion_idxs[clamped_ts].to(self.device)
+                reset_local_t = (reset_at_time_step - self.motion.motion_start_idx[reset_motion_ids]).clamp(min=0)
+                self.two_layer_sampler.update_episodes_and_failures(reset_motion_ids, reset_local_t, episode_failed)
+
             if torch.any(episode_failed):
                 failed_at_time_step = self.time_steps[env_ids][episode_failed]
+                # Always update the global single-layer sampler's bins (kept for metrics
+                # and backward-compat eval).
                 self.adaptive_timesteps_sampler.update_current_bin_failed_count(failed_at_time_step)
-            phase = self.adaptive_timesteps_sampler.sample(env_ids.numel())
+                if use_layer1_only:
+                    failed_motion_ids = self.motion.motion_idxs[
+                        failed_at_time_step.clamp(0, self.motion.time_step_total - 1)
+                    ].to(self.device)
+                    inc = torch.bincount(failed_motion_ids, minlength=int(num_motions)).float()
+                    # Inject only; decay runs every env step inside step().
+                    self._motion_failed_ema_layer1_only = (
+                        self._motion_failed_ema_layer1_only + self.motion_cfg.adaptive_alpha * inc
+                    )
+            # Note: no decay-only branch here. Per-step decay is handled inside
+            # MotionCommand.step() (parity with the legacy single-layer sampler).
+
+            # Now draw motion_ids and phase.
+            if use_two_layer:
+                sampled_motion_ids, phase = self.two_layer_sampler.sample(n)
+                self.motion_ids[env_ids] = sampled_motion_ids
+            else:
+                phase = self.adaptive_timesteps_sampler.sample(n)
+                if use_layer1_only:
+                    # Mixture form: (1 - r) * failure_p + r * uniform, plus optional cap.
+                    ema = self._motion_failed_ema_layer1_only
+                    failure_p = ema / ema.sum().clamp(min=1e-12)
+                    n_motions = ema.numel()
+                    uniform_p = torch.full_like(ema, 1.0 / max(n_motions, 1))
+                    r = float(self.motion_cfg.adaptive_uniform_ratio)
+                    weights = (1.0 - r) * failure_p + r * uniform_p
+                    cap = float(getattr(self.motion_cfg, "motion_sampling_top1_prob_cap", 0.0))
+                    if cap > 0:
+                        weights = _apply_prob_cap(weights, cap)
+                    self.motion_ids[env_ids] = torch.multinomial(weights, n, replacement=True)
+                else:
+                    self.motion_ids[env_ids] = torch.randint(0, num_motions, (n,), device=self.device)
         else:
-            phase = torch.rand(env_ids.numel(), device=self.device)
+            phase = torch.rand(n, device=self.device)
+            self.motion_ids[env_ids] = torch.randint(0, num_motions, (n,), device=self.device)
 
         if self._env.is_evaluating:
             phase = torch.zeros_like(phase)
+            # Force uniform clip coverage in eval, regardless of training-time weighting.
+            self.motion_ids[env_ids] = torch.arange(n, dtype=torch.long, device=self.device) % num_motions
 
-        # For multi-motion: randomly assign each env to a motion, sample within that motion's range
-        n = env_ids.numel()
-        num_motions = self.motion.num_motions
-        self.motion_ids[env_ids] = torch.randint(0, num_motions, (n,), device=self.device)
         start_idx = self.motion.motion_start_idx[self.motion_ids[env_ids]]
         end_idx = self.motion.motion_end_idx[self.motion_ids[env_ids]]
         motion_len = end_idx - start_idx
@@ -766,6 +1341,14 @@ class MotionCommand(CommandTermBase):
         root_rot = self.motion._body_quat_w[reset_ts, 0]
         root_lin_vel = self.motion._body_lin_vel_w[reset_ts, 0]
         root_ang_vel = self.motion._body_ang_vel_w[reset_ts, 0]
+
+        # Snap running_ref_root_height EMA to the freshly-sampled timestep's
+        # ref pelvis z so SONIC-style adaptive terminations don't carry stale
+        # cross-clip history at episode start.
+        if hasattr(self, "running_ref_root_height"):
+            self.running_ref_root_height[env_ids] = (  # type: ignore[has-type]
+                self.motion._body_pos_w[reset_ts, 0, 2]
+            )
 
         dof_pos = self.motion.get_joint_pos(reset_ts)
         dof_vel = self.motion.get_joint_vel(reset_ts)
@@ -941,6 +1524,20 @@ class MotionCommand(CommandTermBase):
             sim.set_dof_state_tensor_robots(ended_env_ids, sim.dof_state)  # type: ignore[attr-defined]
             sim.refresh_sim_tensors()
 
+        # Update running_ref_root_height EMA (alpha=0.1, matches gear_sonic).
+        # Read the reference pelvis world-z at the current per-env time_step
+        # (motion._body_pos_w is the raw motion-frame body positions, body 0 = root).
+        # Used by SONIC-style adaptive terminations to relax thresholds during
+        # low-pelvis sections (breakdance, kneeling, handstand).
+        ema_alpha_root = 0.1
+        ref_root_z_now = self.motion._body_pos_w[self.time_steps, 0, 2]
+        prev_running = self.running_ref_root_height  # type: ignore[has-type]
+        self.running_ref_root_height = ema_alpha_root * ref_root_z_now + (1.0 - ema_alpha_root) * prev_running
+        # On motion boundary resets, snap the EMA to the new motion's root z
+        # so we don't carry stale state across clip transitions.
+        if ended_env_ids.numel() > 0:
+            self.running_ref_root_height[ended_env_ids] = ref_root_z_now[ended_env_ids]
+
         # 1. update body_pos_relative_w and body_quat_relative_w
         # definition of body_pos/quat_relative_w:
         # If I take this motion data and adapt it to where my robot currently is
@@ -993,6 +1590,24 @@ class MotionCommand(CommandTermBase):
         ### 1.3 update the adaptive timesteps sampler
         if self.motion_cfg.use_adaptive_timesteps_sampler:
             self.adaptive_timesteps_sampler.update_bin_failed_count()
+            # Per-step EMA decay for the two-layer / layer1-only samplers, mirroring
+            # the legacy single-layer sampler's per-step decay above. Without this,
+            # the new samplers' EMAs only decay at reset boundaries — making them
+            # ~Lx more sticky than the legacy sampler at the same alpha (where L is
+            # the average episode length in env steps).
+            tl = getattr(self, "two_layer_sampler", None)
+            if tl is not None:
+                decay = 1.0 - tl.adaptive_alpha
+                tl.motion_failed_ema *= decay
+                tl.bin_failed_ema *= decay
+                # SONIC-style: episode-counter denominator must decay symmetrically
+                # with bin_failed_ema, otherwise per-bin rate = failed/episode collapses
+                # over training (numerator decays, denominator grows).
+                if getattr(tl, "sonic_style", False) and hasattr(tl, "bin_episode_ema"):
+                    tl.bin_episode_ema *= decay
+            ema1 = getattr(self, "_motion_failed_ema_layer1_only", None)
+            if ema1 is not None:
+                ema1 *= 1.0 - self.motion_cfg.adaptive_alpha
 
     @property
     def command(self) -> torch.Tensor:
@@ -1169,8 +1784,25 @@ class MotionCommand(CommandTermBase):
         # resample step, since body tensors lag one frame after teleport.
         self.motion_end_reset = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
+        # EMA of the reference's pelvis world-z, per env. Used by SONIC-style
+        # adaptive terminations to relax thresholds during low-pelvis sections
+        # (breakdance, kneeling, handstand-to-bridge, supine). alpha=0.1 — same
+        # smoothing as gear_sonic's `running_ref_root_height`. Initialized to 0.78m
+        # (rough G1 standing pelvis height) so the first step doesn't miscategorize
+        # everything as "low".
+        self.running_ref_root_height = torch.full((self.num_envs,), 0.78, dtype=torch.float, device=self.device)
+
         if self.motion_cfg.use_adaptive_timesteps_sampler:
             self.adaptive_timesteps_sampler.init_buffers()
+            # Reset two-layer / layer1-only EMAs back to their uniform priors so
+            # reset_all() (called e.g. on training restart) yields a clean state.
+            tl = getattr(self, "two_layer_sampler", None)
+            if tl is not None:
+                tl.motion_failed_ema.fill_(1.0)
+                tl.bin_failed_ema.copy_(tl.bin_valid_mask.float())
+            ema1 = getattr(self, "_motion_failed_ema_layer1_only", None)
+            if ema1 is not None:
+                ema1.fill_(1.0)
 
     def update_metrics(self):
         """Update the metrics. After action, before step() is called."""
@@ -1208,6 +1840,61 @@ class MotionCommand(CommandTermBase):
             self.metrics["motion/adaptive_timesteps_sampler_top1_bin"] = self.adaptive_timesteps_sampler.metrics[
                 "sampling_top1_bin"
             ]
+
+            # Two-layer sampler metrics (only present when adaptive_phase_per_motion=True).
+            tl = getattr(self, "two_layer_sampler", None)
+            if tl is not None:
+                tl.get_stats()
+                self.metrics["motion/two_layer_motion_entropy"] = tl.metrics["motion_sampling_entropy"]
+                self.metrics["motion/two_layer_motion_top1_prob"] = tl.metrics["motion_sampling_top1_prob"]
+                self.metrics["motion/two_layer_motion_top1_id"] = tl.metrics["motion_sampling_top1_id"]
+                self.metrics["motion/two_layer_phase_avg_entropy"] = tl.metrics["motion_phase_avg_entropy"]
+                # Top-K diagnostics: per-rank top-10 clip probs + integer ids.
+                # The named string version (clip filenames + probs) lands in
+                # self.metrics_str so wbt_manager can push it to wandb as text.
+                for k in range(1, 11):
+                    pk_key = f"motion_sampling_top{k}_prob"
+                    ik_key = f"motion_sampling_top{k}_id_int"
+                    if pk_key in tl.metrics:
+                        self.metrics[f"motion/two_layer_top{k}_prob"] = tl.metrics[pk_key]
+                    if ik_key in tl.metrics:
+                        self.metrics[f"motion/two_layer_top{k}_id"] = tl.metrics[ik_key]
+                tl_str = getattr(tl, "metrics_str", None)
+                if tl_str is not None and "motion_sampling_top10_names" in tl_str:
+                    self.metrics_str = getattr(self, "metrics_str", {})
+                    self.metrics_str["motion/two_layer_top10_names"] = tl_str["motion_sampling_top10_names"]
+
+            # Layer-1-only failure-weighted motion sampling metrics.
+            ema1 = getattr(self, "_motion_failed_ema_layer1_only", None)
+            if ema1 is not None:
+                p_layer1 = ema1 / ema1.sum().clamp(min=1e-12)
+                # Apply same mixture form + optional cap to the wandb-logged probability
+                # so the metric reflects the actual sampling distribution.
+                r_floor = float(getattr(self.motion_cfg, "adaptive_uniform_ratio", 0.5))
+                n_mot = int(self.motion.num_motions)
+                uniform_p_layer1 = torch.full_like(p_layer1, 1.0 / max(n_mot, 1))
+                p_mix_layer1 = (1.0 - r_floor) * p_layer1 + r_floor * uniform_p_layer1
+                cap = float(getattr(self.motion_cfg, "motion_sampling_top1_prob_cap", 0.0))
+                if cap > 0:
+                    p_mix_layer1 = _apply_prob_cap(p_mix_layer1, cap)
+                H = -(p_mix_layer1 * (p_mix_layer1 + 1e-12).log()).sum()
+                self.metrics["motion/layer1_motion_entropy"] = H / max(1.0, np.log(max(n_mot, 1)))
+                self.metrics["motion/layer1_motion_top1_prob"] = p_mix_layer1.max()
+                # Top-K for layer-1-only mode (clip name lookup via motion_filenames).
+                K = min(10, n_mot)
+                tk_probs, tk_ids = torch.topk(p_mix_layer1, K)
+                self.metrics["motion/layer1_motion_top1_id"] = tk_ids[0].float() / max(n_mot, 1)
+                for k in range(K):
+                    self.metrics[f"motion/layer1_top{k + 1}_prob"] = tk_probs[k]
+                    self.metrics[f"motion/layer1_top{k + 1}_id"] = tk_ids[k].float()
+                names_attr = getattr(self.motion, "motion_filenames", None)
+                if names_attr is not None and len(names_attr) >= n_mot:
+                    top_names = [names_attr[int(i)] for i in tk_ids.cpu().tolist()]
+                    top_pcts = [f"{float(tk_probs[k]):.3f}" for k in range(K)]
+                    self.metrics_str = getattr(self, "metrics_str", {})
+                    self.metrics_str["motion/layer1_top10_names"] = ", ".join(
+                        f"{n}({p})" for n, p in zip(top_names, top_pcts)
+                    )
 
     #########################################################################################
     ## Internal helpers
